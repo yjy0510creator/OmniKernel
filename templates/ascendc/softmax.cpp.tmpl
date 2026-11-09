@@ -1,0 +1,106 @@
+// [OmniKernel] $OP_NAME — AscendC 后端（模板自动生成）
+// 策略: $STRATEGY
+// ReduceMax -> Subs -> Exp -> ReduceSum -> Divs；行方向，fp32 中间态。
+// 编译: atvc -O2 kernel.cpp -o softmax.auto -mcpu=ascend910b（CANN>=8.0）
+#include "kernel_operator.h"
+
+using namespace AscendC;
+
+template <typename T>
+class SoftmaxKernel {
+public:
+    __aicore__ inline SoftmaxKernel(GM_ADDR x, GM_ADDR y,
+                                    int64_t rows, int64_t cols, float scale)
+        : rows(rows), cols(cols), scale(scale) {
+        this->xGm.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(x));
+        this->yGm.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(y));
+        this->xIn.InitBuffer(2, $TILE_ELEMS * sizeof(T));
+        this->yOut.InitBuffer(2, $TILE_ELEMS * sizeof(T));
+        this->xFBuf.InitBuffer($TILE_ELEMS * sizeof(float));
+        this->eBuf.InitBuffer($TILE_ELEMS * sizeof(float));
+        this->redBuf.InitBuffer(2 * 1024);
+    }
+
+    __aicore__ inline void Process() {
+        for (int64_t row = this->coreIdx; row < this->rows; row += this->coreNum) {
+            CopyIn(row);
+            Compute(row);
+            CopyOut(row);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(int64_t row) {
+        LocalTensor<T> x = this->xIn.AllocTensor<T>();
+        DataCopyExtParams cp = {1u, static_cast<uint32_t>(this->cols * sizeof(T)),
+                                0u, 0u, 0u};
+        DataCopyPad(x, this->xGm[row * this->cols], cp);
+        this->xIn.EnQue(x);
+    }
+
+    __aicore__ inline void Compute(int64_t row) {
+        LocalTensor<T> x = this->xIn.DeQue<T>();
+        LocalTensor<float> xf = this->xFBuf.Get<float>();
+        LocalTensor<float> ef = this->eBuf.Get<float>();
+        LocalTensor<float> red = this->redBuf.Get<float>();
+        Cast(xf, x, CastCalRound::ROUND, this->cols);
+        Muls(xf, xf, this->scale, this->cols);
+        // 1) 行最大
+        ReduceMaxParams rm{ReduceType::REDUCE_MAX, 1, 1,
+                           static_cast<uint64_t>(this->cols) * sizeof(float),
+                           static_cast<uint64_t>(sizeof(float)),
+                           static_cast<uint64_t>(this->cols)};
+        ReduceMax(red, xf, rm);
+        float rowMax = red.GetValue(0);
+        // 2) exp(x - max)（fp32 Exp，精度阈值内与 libdevice 一致）
+        Subs(ef, xf, rowMax, this->cols);
+        Exp(ef, ef, this->cols);
+        // 3) sum(exp)
+        ReduceSumParams rs{ReduceType::REDUCE_SUM, 1, 1,
+                           static_cast<uint64_t>(this->cols) * sizeof(float),
+                           static_cast<uint64_t>(sizeof(float)),
+                           static_cast<uint64_t>(this->cols)};
+        LocalTensor<float> red2 = this->redBuf.GetAdditional<float>();
+        ReduceSum(red2, ef, rs);
+        float rowSum = red2.GetValue(0);
+        // 4) 归一并降精度写回
+        Divs(ef, ef, rowSum, this->cols);
+        LocalTensor<T> y = this->yOut.AllocTensor<T>();
+        Cast(y, ef, CastCalRound::ROUND, this->cols);
+        this->yOut.EnQue(y);
+        this->xIn.Recycle(x);
+    }
+
+    __aicore__ inline void CopyOut(int64_t row) {
+        LocalTensor<T> y = this->yOut.DeQue<T>();
+        DataCopyExtParams cp = {1u, static_cast<uint32_t>(this->cols * sizeof(T)),
+                                0u, 0u, 0u};
+        DataCopyPad(this->yGm[row * this->cols], y, cp);
+        this->yOut.FreeTensor(y);
+    }
+
+    GlobalTensor<T> xGm, yGm;
+    TQue<QuePosition::VECIN, 2> xIn;
+    TQue<QuePosition::VECOUT, 2> yOut;
+    TBuf<QuePosition::VECCALC> xFBuf, eBuf, redBuf;
+    int64_t rows, cols;
+    float scale;
+    uint32_t coreIdx = GetBlockIdx();
+    uint32_t coreNum = GetBlockNum();
+};
+
+extern "C" __global__ __aicore__ void softmax_gen(GM_ADDR x, GM_ADDR y,
+                                                  GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tilingData, tiling);
+    REGISTER_KERNEL(T_TYPE);
+    if (T_TYPE == DESC_DT_FLOAT16) {
+        SoftmaxKernel<half> op(x, y, tilingData.rows, tilingData.cols, tilingData.scale);
+        op.Process();
+    } else if (T_TYPE == DESC_DT_BFLOAT16) {
+        SoftmaxKernel<bfloat16_t> op(x, y, tilingData.rows, tilingData.cols, tilingData.scale);
+        op.Process();
+    } else {
+        SoftmaxKernel<float> op(x, y, tilingData.rows, tilingData.cols, tilingData.scale);
+        op.Process();
+    }
+}

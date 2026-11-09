@@ -1,0 +1,48 @@
+# AISHPerf 评测套件定义 —— OmniKernel 算子生成
+# 对齐 aishperf_openness 3.0「算子生成智能体评测套件」的套件 schema（草案，
+# 字段以官方最新 schema 为准，接入前用官方 validate 校验）。
+suite:
+  name: omnikernel_operator_gen
+  version: "1.0.0"
+  description: >
+    对 OmniKernel 框架自动生成的推理算子做三维验证：
+    编译正确性 → 数值精度 → 性能（延迟/吞吐/显存），
+    并考核跨硬件（昇腾 NPU / NVIDIA GPU）一致替换能力。
+  benchmark_focus: deployability_in_quantized_inference   # 工程可部署性为评测重心
+
+  # 被测算子集（与 operator_specs/ 一一对应）
+  operators:
+    - {id: rmsnorm,          task: inference-forward, type: normalization}
+    - {id: rope,             task: inference-forward, type: position-embedding}
+    - {id: softmax,          task: inference-forward, type: activation-normalization}
+    - {id: silu_mul,         task: inference-forward, type: activation-fused}
+    - {id: flash_attn,       task: inference-forward, type: attention-fused}
+    - {id: quant_gemm_w8a8,  task: inference-forward, type: quantized-matmul}
+
+  # 目标硬件实体（引用 entities/）
+  targets:
+    - entity: ascend-910b
+      backend: ascendc
+    - entity: nvidia-a100
+      backend: triton
+
+  # 验证阶段（顺序执行，前一阶段不过则后续不计分）
+  stages:
+    - stage: compile
+      check: "atvc/nvcc/triton JIT 编译零 error"
+      metric: compile_success_rate
+    - stage: numerical
+      check: "对 fp32 eager 参考实现逐 workload 比对，满足 rules 阈值"
+      metric: precision_pass_rate
+    - stage: performance
+      check: "延迟/吞吐/显存对标基线，量化算子额外验证端到端替换一致性"
+      metric: [latency_us, throughput, peak_mem_mb, speedup_vs_baseline]
+
+  # 汇总指标（写入 results/，供 AISHPerf 报告抽取）
+  report_metrics:
+    - compile_success_rate
+    - precision_pass_rate
+    - mean_latency_us
+    - mean_speedup
+    - max_peak_mem_mb
+    - cross_backend_consistency     # 同一 spec 在 NPU/GPU 上的精度/结果一致性

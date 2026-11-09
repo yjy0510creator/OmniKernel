@@ -1,0 +1,32 @@
+"""[OmniKernel] $OP_NAME — Triton 后端（模板自动生成）
+策略: $STRATEGY；max-subtraction 数值稳定；$ONLINE_TWO_PASS
+"""
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _softmax_fwd(X, Y, n_cols, scale, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK)
+    mask = cols < n_cols
+    x = tl.load(X + row * n_cols + cols, mask=mask,
+                other=float("-inf")).to(tl.float32) * scale
+    m = tl.max(x, axis=0)
+    e = tl.exp(x - m)
+    d = tl.sum(e, axis=0)
+    tl.store(Y + row * n_cols + cols, (e / d).to(Y.dtype.element_ty), mask=mask)
+
+
+def run(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+    """行方向 softmax（x 视为 [rows, cols] 连续张量）。"""
+    xr = x.contiguous().view(-1, x.shape[-1])
+    n = xr.shape[1]
+    y = torch.empty_like(xr)
+    BLOCK = triton.next_power_of_2(n)
+    nw = $NUM_WARPS
+    if BLOCK >= 8192:
+        nw = 32
+    _softmax_fwd[(xr.shape[0],)](xr, y, n, scale, BLOCK=BLOCK, num_warps=nw)
+    return y.view_as(x)

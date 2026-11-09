@@ -1,0 +1,22 @@
+# 指标映射：OmniKernel harness JSON 字段 → AISHPerf 报告指标
+# 用法：AISHPerf 结果抽取器读取 run/ 产出的 JSON，按本映射归一化。
+metrics:
+  source: results/report_*.json     # validation.run_all 输出
+  mapping:
+    compile_success_rate:
+      extract: "count(stage=compile ok) / count(total)"
+    precision_pass_rate:
+      extract: "count(ok=true) / count(total)"
+      unit: ratio
+    mean_latency_us:
+      extract: "avg(latency_us)"
+      unit: us
+    mean_speedup:
+      extract: "avg(baseline_us / latency_us)"
+      unit: ratio
+    max_peak_mem_mb:
+      extract: "max(peak_mem_mb)"
+      unit: MB
+    cross_backend_consistency:
+      extract: "pairwise_max_abs_diff(triton_out, ascendc_out) per op"
+      unit: ratio

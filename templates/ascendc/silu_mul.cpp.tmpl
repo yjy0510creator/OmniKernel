@@ -1,0 +1,96 @@
+// [OmniKernel] $OP_NAME — AscendC 后端（模板自动生成）
+// 策略: $STRATEGY
+// Sigmoid -> Mul -> Mul 三级 Vector 流水，双缓冲打满 AIV 带宽。
+// 编译: atvc -O2 kernel.cpp -o silu_mul.auto -mcpu=ascend910b（CANN>=8.0）
+#include "kernel_operator.h"
+
+using namespace AscendC;
+
+template <typename T>
+class SiluMulKernel {
+public:
+    __aicore__ inline SiluMulKernel(GM_ADDR a, GM_ADDR b, GM_ADDR y, int64_t n)
+        : n(n) {
+        this->aGm.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(a));
+        this->bGm.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(b));
+        this->yGm.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(y));
+        this->aIn.InitBuffer(2, $TILE_ELEMS * sizeof(T));
+        this->bIn.InitBuffer(2, $TILE_ELEMS * sizeof(T));
+        this->yOut.InitBuffer(2, $TILE_ELEMS * sizeof(T));
+        this->fBuf.InitBuffer($TILE_ELEMS * sizeof(float));
+        this->gBuf.InitBuffer($TILE_ELEMS * sizeof(float));
+    }
+
+    __aicore__ inline void Process() {
+        int64_t perCore = (this->n + this->coreNum - 1) / this->coreNum;
+        int64_t lo = this->coreIdx * perCore;
+        int64_t hi = (lo + perCore < this->n) ? lo + perCore : this->n;
+        for (int64_t off = lo; off < hi; off += $TILE_ELEMS) {
+            int64_t len = ($TILE_ELEMS < hi - off) ? $TILE_ELEMS : (hi - off);
+            CopyIn(off, len);
+            Compute(off, len);
+            CopyOut(off, len);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(int64_t off, int64_t len) {
+        LocalTensor<T> a = this->aIn.AllocTensor<T>();
+        DataCopyExtParams p = {1u, static_cast<uint32_t>(len * sizeof(T)), 0u, 0u, 0u};
+        DataCopyPad(a, this->aGm[off], p);
+        this->aIn.EnQue(a);
+        LocalTensor<T> b = this->bIn.AllocTensor<T>();
+        DataCopyPad(b, this->bGm[off], p);
+        this->bIn.EnQue(b);
+    }
+
+    __aicore__ inline void Compute(int64_t off, int64_t len) {
+        LocalTensor<T> a = this->aIn.DeQue<T>();
+        LocalTensor<T> b = this->bIn.DeQue<T>();
+        LocalTensor<float> af = this->fBuf.Get<float>();   // a 的 fp32
+        LocalTensor<float> bf = this->gBuf.Get<float>();   // b 的 fp32
+        // 1) 升精度
+        Cast(af, a, CastCalRound::ROUND, len);
+        Cast(bf, b, CastCalRound::ROUND, len);
+        // 2) sg = sigmoid(a)（复用 af 额外视图区）
+        LocalTensor<float> sg = this->fBuf.GetAdditional<float>();
+        Sigmoid(sg, af, len);
+        // 3) silu(a) = a * sigmoid(a)
+        Mul(af, af, sg, len);
+        // 4) out = silu(a) * b
+        Mul(af, af, bf, len);
+        LocalTensor<T> y = this->yOut.AllocTensor<T>();
+        Cast(y, af, CastCalRound::ROUND, len);
+        this->yOut.EnQue(y);
+        this->aIn.Recycle(a);
+        this->bIn.Recycle(b);
+    }
+
+    __aicore__ inline void CopyOut(int64_t off, int64_t len) {
+        LocalTensor<T> y = this->yOut.DeQue<T>();
+        DataCopyExtParams p = {1u, static_cast<uint32_t>(len * sizeof(T)), 0u, 0u, 0u};
+        DataCopyPad(this->yGm[off], y, p);
+        this->yOut.FreeTensor(y);
+    }
+
+    GlobalTensor<T> aGm, bGm, yGm;
+    TQue<QuePosition::VECIN, 2> aIn, bIn;
+    TQue<QuePosition::VECOUT, 2> yOut;
+    TBuf<QuePosition::VECCALC> fBuf, gBuf;
+    int64_t n;
+    uint32_t coreIdx = GetBlockIdx();
+    uint32_t coreNum = GetBlockNum();
+};
+
+extern "C" __global__ __aicore__ void silu_mul_gen(GM_ADDR a, GM_ADDR b, GM_ADDR y,
+                                                   GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tilingData, tiling);
+    REGISTER_KERNEL(T_TYPE);
+    if (T_TYPE == DESC_DT_FLOAT16) {
+        SiluMulKernel<half> op(a, b, y, tilingData.n);
+        op.Process();
+    } else if (T_TYPE == DESC_DT_BFLOAT16) {
+        SiluMulKernel<bfloat16_t> op(a, b, y, tilingData.n);
+        op.Process();
+    }
+}

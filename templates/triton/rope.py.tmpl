@@ -1,0 +1,37 @@
+"""[OmniKernel] $OP_NAME — Triton 后端（模板自动生成）
+策略: $STRATEGY（NeoX 半拼接旋转；cos/sin 表由宿主预计算）
+"""
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _rope_fwd(X, COS, SIN, Y, seq_len,
+              HEAD_DIM: tl.constexpr, HALF: tl.constexpr, BLOCK: tl.constexpr):
+    row = tl.program_id(0)          # batch*head
+    s = tl.program_id(1)
+    cols = tl.arange(0, BLOCK)
+    mask = cols < HEAD_DIM
+    base = row * seq_len * HEAD_DIM + s * HEAD_DIM
+    x = tl.load(X + base + cols, mask=mask, other=0.0).to(tl.float32)
+    other_idx = tl.where(cols < HALF, cols + HALF, cols - HALF)
+    xr = tl.load(X + base + other_idx, mask=mask, other=0.0).to(tl.float32)
+    sign = tl.where(cols < HALF, -1.0, 1.0)
+    c = tl.load(COS + s * HEAD_DIM + cols, mask=mask, other=0.0)
+    sn = tl.load(SIN + s * HEAD_DIM + cols, mask=mask, other=0.0)
+    y = x * c + sign * xr * sn
+    tl.store(Y + base + cols, y.to(Y.dtype.element_ty), mask=mask)
+
+
+def run(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """x:[b,h,s,d]; cos/sin:[s,d] fp32; 返回同形状旋转结果。"""
+    b, hh, s, d = x.shape
+    y = torch.empty_like(x)
+    BLOCK = max($HALF_BLOCK * 2, triton.next_power_of_2(d))
+    _rope_fwd[(b * hh, s)](
+        x, cos, sin, y, s,
+        HEAD_DIM=d, HALF=d // 2, BLOCK=BLOCK,
+        num_warps=$NUM_WARPS,
+    )
+    return y

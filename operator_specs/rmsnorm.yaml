@@ -1,0 +1,47 @@
+id: rmsnorm
+name: RMSNorm
+category: normalization
+task_type: inference-forward
+description: >
+  Root Mean Square Layer Normalization，LLaMA/Qwen 系列大模型主力归一化算子。
+  相比 LayerNorm 去掉均值中心化，仅保留方差归一 + 逐通道缩放，行方向全归约。
+math: |
+  rms = sqrt(mean(x_i^2, axis=last_dim) + eps)
+  out_i = x_i / rms * w_i
+io:
+  inputs:
+    - {name: x, shape: "[batch, seq, hidden]", dtypes: [fp16, bf16, fp32], layout: row-major}
+    - {name: w, shape: "[hidden]",            dtypes: [fp16, bf16, fp32]}
+  outputs:
+    - {name: y, shape: "[batch, seq, hidden]", dtypes: same-as-x}
+  scalars:
+    - {name: eps, type: float, default: 1.0e-5}
+dtype_support: [fp16, bf16, fp32]
+tolerance:            # 与 fp32 eager 参考实现比对的通过阈值（harness 判据）
+  fp16: {atol: 1.0e-2, rtol: 1.0e-2}
+  bf16: {atol: 2.0e-2, rtol: 2.0e-2}
+  fp32: {atol: 1.0e-5, rtol: 1.0e-5}
+workloads:            # AISHPerf 形状矩阵：覆盖解码(batch大/seq小)与预填充(seq大)
+  - {batch: 1,  seq: 1,    hidden: 4096}
+  - {batch: 8,  seq: 2048, hidden: 4096}
+  - {batch: 32, seq: 512,  hidden: 2048}
+  - {batch: 4,  seq: 4096, hidden: 8192}
+codegen:
+  triton:
+    template: templates/triton/rmsnorm.py.tmpl
+    params:
+      BLOCK_SIZE: auto_pow2(hidden)   # 单行一 block，自动取 >=hidden 的最小 2 幂
+      NUM_WARPS: auto                 # <=1024:4, <=4096:8, else 16
+      ACCUM_DTYPE: tl.float32         # 归约累加用 fp32 保证数值稳定
+    strategy: 一行一 program；全行驻留寄存器；fp32 累加；单次 global 读写
+  ascendc:
+    template: templates/ascendc/rmsnorm.cpp.tmpl
+    params:
+      TILE_ELEMS: 4096                # UB 单 tile 元素数，hidden 超过时分块多遍
+      ACCUM_DTYPE: float
+    strategy: GM->UB 双缓冲；ReduceSum+Div+Sqrt+Mul+Cast Vector 流水；逐行分块回写
+fusion_opportunities:
+  - 与相邻残差 add 融合，省一次读写
+  - 权重 w 常驻 UB，多行复用
+notes: >
+  hidden 非 2 幂时 Triton 用 mask 处理；AscendC 按 256 字节对齐分块。

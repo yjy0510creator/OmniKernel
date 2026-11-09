@@ -1,0 +1,48 @@
+id: rope
+name: RoPE
+category: position-embedding
+task_type: inference-forward
+description: >
+  Rotary Position Embedding（NeoX/GPT-NeoX 半拼接风格，LLaMA 系列采用）。
+  对 q/k 向量的每对相邻通道施加随位置变化的二维旋转，纯逐元素算子、带宽受限。
+math: |
+  half = head_dim / 2
+  angle_p = pos_s / theta^(2p/head_dim)          # p in [0, half)
+  out[.., p]        = x[.., p]*cos(angle_p) - x[.., p+half]*sin(angle_p)
+  out[.., p+half]   = x[.., p+half]*cos(angle_p) + x[.., p]*sin(angle_p)
+io:
+  inputs:
+    - {name: x, shape: "[batch, heads, seq, head_dim]", dtypes: [fp16, bf16]}
+    - {name: cos, shape: "[seq, head_dim]", dtypes: [fp32]}
+    - {name: sin, shape: "[seq, head_dim]", dtypes: [fp32]}
+  outputs:
+    - {name: y, shape: "[batch, heads, seq, head_dim]", dtypes: same-as-x}
+  scalars: []
+dtype_support: [fp16, bf16]
+tolerance:
+  fp16: {atol: 1.0e-2, rtol: 1.0e-2}
+  bf16: {atol: 2.0e-2, rtol: 2.0e-2}
+workloads:
+  - {batch: 1,  heads: 32, seq: 1,    head_dim: 128}
+  - {batch: 4,  heads: 32, seq: 2048, head_dim: 128}
+  - {batch: 2,  heads: 40, seq: 4096, head_dim: 128}
+  - {batch: 8,  heads: 16, seq: 1024, head_dim: 64}
+codegen:
+  triton:
+    template: templates/triton/rope.py.tmpl
+    params:
+      HALF_BLOCK: auto_pow2(head_dim/2)
+      NUM_WARPS: 2
+      MERGE_COS_CACHE: true
+    strategy: 每 program 处理一行(head_dim)；cos/sin 沿 (b,h) 复用；fp32 计算一次写回
+  ascendc:
+    template: templates/ascendc/rope.cpp.tmpl
+    params:
+      TILE_ELEMS: 2048
+    strategy: 输入拆两半入 UB；Mul/Add/Sub Vector 指令；cos/sin 表预加载常驻 UB
+fusion_opportunities:
+  - 与 qkv-proj 输出融合，避免 x 落显存
+  - 与 KV-Cache 写入融合
+notes: >
+  cos/sin 由宿主侧按位置预先计算（等价 torch 实现），kernel 只做旋转；
+  interleaved 风格可通过改 spec 模板变量支持，展示生成器对语义变体的覆盖。

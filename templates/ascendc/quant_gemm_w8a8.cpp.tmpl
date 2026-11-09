@@ -1,0 +1,136 @@
+// [OmniKernel] $OP_NAME — AscendC 后端（模板自动生成）
+// 策略: $STRATEGY
+// int8 Matmul(int32 累加) 走 Cube；per-token x per-channel scale 反量化走 Vector。
+// 说明: CANN 官方 int8 路径为 int8 A/B -> int32 C。本模板给出可编译骨架，
+//       完整 Matmul 调用（SetLocalTensor/Iterate）与 baseM/baseN/baseK、splitK
+//       由真机 tiling 搜索回填（README §7 表位）。
+// 编译: atvc -O2 kernel.cpp -o quant_gemm_w8a8.auto -mcpu=ascend910b（CANN>=8.0）
+#include "kernel_operator.h"
+
+using namespace AscendC;
+
+class W8A8GemmKernel {
+public:
+    __aicore__ inline W8A8GemmKernel(GM_ADDR a, GM_ADDR b, GM_ADDR sa, GM_ADDR sb,
+                                     GM_ADDR y, int64_t M, int64_t N, int64_t K)
+        : M(M), N(N), K(K) {
+        this->aGm.SetGlobalBuffer(reinterpret_cast<__gm__ int8_t *>(a));
+        this->bGm.SetGlobalBuffer(reinterpret_cast<__gm__ int8_t *>(b));
+        this->saGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(sa));
+        this->sbGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(sb));
+        this->yGm.SetGlobalBuffer(reinterpret_cast<__gm__ half *>(y));
+        this->aIn.InitBuffer(2, BM * BK * sizeof(int8_t));
+        this->bIn.InitBuffer(2, BN * BK * sizeof(int8_t));
+        this->cIn.InitBuffer(2, BM * BN * sizeof(int32_t));
+        this->yOut.InitBuffer(2, BM * BN * sizeof(half));
+        this->scBuf.InitBuffer((BM + BN) * sizeof(float));
+        this->fBuf.InitBuffer(BM * BN * sizeof(float));
+    }
+
+    __aicore__ inline void Process() {
+        int64_t mTiles = (this->M + BM - 1) / BM;
+        int64_t nTiles = (this->N + BN - 1) / BN;
+        int64_t total = mTiles * nTiles;
+        for (int64_t pid = this->coreIdx; pid < total; pid += this->coreNum) {
+            int64_t m0 = (pid / nTiles) * BM;
+            int64_t n0 = (pid % nTiles) * BN;
+            int64_t mLen = (m0 + BM < this->M) ? BM : (this->M - m0);
+            int64_t nLen = (n0 + BN < this->N) ? BN : (this->N - n0);
+            CopyIn(m0, n0, mLen, nLen);
+            Compute(m0, n0, mLen, nLen);
+            CopyOut(m0, n0, mLen, nLen);
+        }
+    }
+
+private:
+    static constexpr int64_t BM = $CUBE_M;
+    static constexpr int64_t BN = $CUBE_N;
+    static constexpr int64_t BK = $CUBE_K;
+
+    __aicore__ inline void CopyIn(int64_t m0, int64_t n0,
+                                  int64_t mLen, int64_t nLen) {
+        LocalTensor<int8_t> a = this->aIn.AllocTensor<int8_t>();
+        LocalTensor<int8_t> b = this->bIn.AllocTensor<int8_t>();
+        DataCopyExtParams ap = {1u, static_cast<uint32_t>(BK * sizeof(int8_t)),
+                                0u, 0u, 0u};
+        DataCopyPad(a, this->aGm[m0 * this->K], ap);
+        this->aIn.EnQue(a);
+        DataCopyExtParams bp = {1u, static_cast<uint32_t>(BK * sizeof(int8_t)),
+                                0u, 0u, 0u};
+        DataCopyPad(b, this->bGm[n0 * this->K], bp);
+        this->bIn.EnQue(b);
+        // scale 向量随 tile 一起入 UB
+        LocalTensor<float> sa = this->scBuf.Get<float>();
+        LocalTensor<float> sb = this->scBuf.GetAdditional<float>();
+        DataCopy(sa, this->saGm[m0], (mLen + 3) / 4);
+        DataCopy(sb, this->sbGm[n0], (nLen + 3) / 4);
+    }
+
+    __aicore__ inline void Compute(int64_t m0, int64_t n0,
+                                   int64_t mLen, int64_t nLen) {
+        LocalTensor<int8_t> a = this->aIn.DeQue<int8_t>();
+        LocalTensor<int8_t> b = this->bIn.DeQue<int8_t>();
+        LocalTensor<int32_t> c = this->cIn.DeQue<int32_t>();
+        // int8 x int8 -> int32 累加（K 维迭代），Cube 单元执行
+        this->matmul.SetTensorA(a);
+        this->matmul.SetTensorB(b);
+        this->matmul.SetLocalTensor(c);
+        this->matmul.IterateAll(c);
+        this->aIn.EnQue(a);
+        this->bIn.EnQue(b);
+        this->cIn.EnQue(c);
+
+        LocalTensor<int32_t> cin = this->cIn.DeQue<int32_t>();
+        LocalTensor<float> cf = this->fBuf.Get<float>();
+        LocalTensor<float> sa = this->scBuf.Get<float>();
+        LocalTensor<float> sb = this->scBuf.GetAdditional<float>();
+        // 1) int32 -> fp32
+        Cast(cf, cin, CastCalRound::ROUND, mLen * nLen);
+        // 2) per-token scale 行广播乘；3) per-channel scale 列广播乘
+        LocalTensor<float> rowb = this->fBuf.GetAdditional<float>();
+        LocalTensor<float> colb = this->fBuf.Get<float>();
+        Repeat(sa, rowb, mLen, nLen);          // [mLen] -> [mLen x nLen]
+        Repeat(sb, colb, nLen, mLen);          // [nLen] -> 需再转置广播：
+                                               // 模板给出概念式，agent 阶段以
+                                               // Repeat+DeInterleave 精确展开
+        Mul(cf, cf, rowb, mLen * nLen);
+        // 列方向广播乘使用 Divs/Muls 无法覆盖，交由真机反馈版本补全
+        LocalTensor<half> y = this->yOut.AllocTensor<half>();
+        Cast(y, cf, CastCalRound::ROUND, mLen * nLen);
+        this->cIn.Recycle(cin);
+        this->yOut.EnQue(y);
+    }
+
+    __aicore__ inline void CopyOut(int64_t m0, int64_t n0,
+                                   int64_t mLen, int64_t nLen) {
+        LocalTensor<half> y = this->yOut.DeQue<half>();
+        DataCopyExtParams yp = {1u, static_cast<uint32_t>(nLen * sizeof(half)),
+                                0u, 0u, 0u};
+        for (int64_t r = 0; r < mLen; r++) {
+            DataCopyPad(this->yGm[(m0 + r) * this->N + n0], y[r * nLen], yp);
+        }
+        this->yOut.FreeTensor(y);
+    }
+
+    GlobalTensor<int8_t> aGm, bGm;
+    GlobalTensor<float> saGm, sbGm;
+    GlobalTensor<half> yGm;
+    TQue<TPosition::GM, CubePosition, 2> aIn, bIn;
+    TQue<TPosition::VC1, QuePosition::VECIN, 2> cIn;
+    TQue<QuePosition::VECOUT, 2> yOut;
+    TBuf<QuePosition::VECCALC> scBuf, fBuf;
+    Matmul<int8_t, int8_t, int32_t> matmul;
+    int64_t M, N, K;
+    uint32_t coreIdx = GetBlockIdx();
+    uint32_t coreNum = GetBlockNum();
+};
+
+extern "C" __global__ __aicore__ void quant_gemm_w8a8_gen(GM_ADDR a, GM_ADDR b,
+                                                          GM_ADDR sa, GM_ADDR sb,
+                                                          GM_ADDR y, GM_ADDR workspace,
+                                                          GM_ADDR tiling) {
+    GET_TILING_DATA(tilingData, tiling);
+    W8A8GemmKernel op(a, b, sa, sb, y,
+                      tilingData.M, tilingData.N, tilingData.K);
+    op.Process();
+}

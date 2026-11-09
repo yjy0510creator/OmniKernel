@@ -1,0 +1,18 @@
+# 被测硬件实体：NVIDIA A100（草案，字段对齐 aishperf_openness entities 规范）
+entity:
+  name: nvidia-a100
+  kind: accelerator
+  vendor: nvidia
+  arch: sm80
+  device_count: 8
+  memory_gb: 40
+  software_stack:
+    driver: ">=535"
+    cuda: "12.3"
+    torch: ">=2.1"
+    triton: ">=2.2"
+  backend: triton
+  compile_cmd: "python -c 'import triton; triton.compile(...)'"   # JIT，无独立离线编译
+  notes: >
+    同一实体亦适用于 H100(sm90)：Triton 后端源码不变，仅 arch 字段与
+    num_warps/num_stages 调优参数不同——体现 OmniKernel 的跨代兼容设计。

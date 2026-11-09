@@ -1,0 +1,109 @@
+// [OmniKernel] $OP_NAME — AscendC 后端（模板自动生成）
+// 策略: $STRATEGY
+// NeoX 半拼接旋转；单行(headDim)一 tile，位置索引 s=row%seq 与 cos/sin 行严格对齐。
+// 编译: atvc -O2 kernel.cpp -o rope.auto -mcpu=ascend910b（CANN>=8.0）
+#include "kernel_operator.h"
+
+using namespace AscendC;
+
+template <typename T>
+class RopeKernel {
+public:
+    __aicore__ inline RopeKernel(GM_ADDR x, GM_ADDR cs, GM_ADDR sn, GM_ADDR y,
+                                 int64_t rows, int64_t seq, int64_t headDim)
+        : rows(rows), seq(seq), headDim(headDim), half(headDim / 2) {
+        this->xGm.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(x));
+        this->yGm.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(y));
+        this->cosGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(cs));
+        this->sinGm.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(sn));
+        this->xIn.InitBuffer(2, $TILE_ELEMS * sizeof(T));
+        this->yOut.InitBuffer(2, $TILE_ELEMS * sizeof(T));
+        this->xFBuf.InitBuffer($TILE_ELEMS * sizeof(float));   // xf 主区 + t1/t2 视图
+        this->csBuf.InitBuffer($TILE_ELEMS * sizeof(float));   // cos 主区 + sn 视图
+    }
+
+    __aicore__ inline void Process() {
+        for (int64_t row = this->coreIdx; row < this->rows; row += this->coreNum) {
+            int64_t s = row % this->seq;   // x 布局 [b,h,s,d] 展平行 -> 位置索引
+            CopyIn(row);
+            LoadTable(s);
+            Compute();
+            CopyOut(row);
+        }
+    }
+
+private:
+    __aicore__ inline void CopyIn(int64_t row) {
+        LocalTensor<T> x = this->xIn.AllocTensor<T>();
+        DataCopyExtParams cp = {1u, static_cast<uint32_t>(this->headDim * sizeof(T)),
+                                0u, 0u, 0u};
+        DataCopyPad(x, this->xGm[row * this->headDim], cp);
+        this->xIn.EnQue(x);
+    }
+
+    __aicore__ inline void LoadTable(int64_t s) {
+        DataCopyExtParams p = {1u, static_cast<uint32_t>(this->headDim * sizeof(float)),
+                               0u, 0u, 0u};
+        LocalTensor<float> c = this->csBuf.Get<float>();
+        DataCopyPad(c, this->cosGm[s * this->headDim], p);
+        LocalTensor<float> sn = this->csBuf.GetAdditional<float>();
+        DataCopyPad(sn, this->sinGm[s * this->headDim], p);
+    }
+
+    __aicore__ inline void Compute() {
+        LocalTensor<T> x = this->xIn.DeQue<T>();
+        LocalTensor<float> xf = this->xFBuf.Get<float>();
+        LocalTensor<float> t1 = this->xFBuf.GetAdditional<float>();   // t1/t2 邻区
+        LocalTensor<float> t2 = t1[this->half];
+        LocalTensor<float> c = this->csBuf.Get<float>();
+        LocalTensor<float> sn = this->csBuf.GetAdditional<float>();
+        Cast(xf, x, CastCalRound::ROUND, this->headDim);
+        // out1 = x1*cos1 - x2*sin1   （元素 [0, half)）
+        // out2 = x2*cos2 + x1*sin2   （元素 [half, headDim)）
+        LocalTensor<float> x1 = xf;
+        LocalTensor<float> x2 = xf[this->half];
+        Mul(t1, x2, sn, this->half);                    // x2*sin1
+        Mul(t2, x1, sn[this->half], this->half);        // x1*sin2
+        Mul(x1, x1, c, this->half);                     // x1*cos1（就地）
+        Mul(x2, x2, c[this->half], this->half);         // x2*cos2（就地）
+        Subs(x1, x1, t1, this->half);                   // out1
+        Adds(x2, x2, t2, this->half);                   // out2
+        LocalTensor<T> y = this->yOut.AllocTensor<T>();
+        Cast(y, xf, CastCalRound::ROUND, this->headDim);
+        this->yOut.EnQue(y);
+        this->xIn.Recycle(x);
+    }
+
+    __aicore__ inline void CopyOut(int64_t row) {
+        LocalTensor<T> y = this->yOut.DeQue<T>();
+        DataCopyExtParams cp = {1u, static_cast<uint32_t>(this->headDim * sizeof(T)),
+                                0u, 0u, 0u};
+        DataCopyPad(this->yGm[row * this->headDim], y, cp);
+        this->yOut.FreeTensor(y);
+    }
+
+    GlobalTensor<T> xGm, yGm;
+    GlobalTensor<float> cosGm, sinGm;
+    TQue<QuePosition::VECIN, 2> xIn;
+    TQue<QuePosition::VECOUT, 2> yOut;
+    TBuf<QuePosition::VECCALC> xFBuf, csBuf;
+    int64_t rows, seq, headDim, half;
+    uint32_t coreIdx = GetBlockIdx();
+    uint32_t coreNum = GetBlockNum();
+};
+
+extern "C" __global__ __aicore__ void rope_gen(GM_ADDR x, GM_ADDR cs, GM_ADDR sn,
+                                               GM_ADDR y, GM_ADDR workspace,
+                                               GM_ADDR tiling) {
+    GET_TILING_DATA(tilingData, tiling);
+    REGISTER_KERNEL(T_TYPE);
+    if (T_TYPE == DESC_DT_FLOAT16) {
+        RopeKernel<half> op(x, cs, sn, y, tilingData.rows, tilingData.seq,
+                            tilingData.headDim);
+        op.Process();
+    } else if (T_TYPE == DESC_DT_BFLOAT16) {
+        RopeKernel<bfloat16_t> op(x, cs, sn, y, tilingData.rows, tilingData.seq,
+                                  tilingData.headDim);
+        op.Process();
+    }
+}

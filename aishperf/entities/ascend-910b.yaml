@@ -1,0 +1,20 @@
+# 被测硬件实体：昇腾 910B（草案，字段对齐 aishperf_openness rules/remote/ascend-910b）
+entity:
+  name: ascend-910b
+  kind: accelerator
+  vendor: huawei-ascend
+  arch: davinci-c2
+  device_count: 8
+  memory_gb: 64
+  software_stack:
+    driver: ">=23.0"
+    firmware: ">=1.85"
+    cann: ">=8.0"           # 提供 atvc 编译链与 AscendC runtime
+    torch_npu: ">=2.1"
+    cbb: ">=3.0"            # 自定义算子 CANN Basic Block
+  backend: ascendc
+  kernel_ext: ".pt2"        # torch.compile / torch_npu 自定义算子注册格式
+  compile_cmd: "atvc -O2 {src} -o {obj} -mcpu=ascend910b"
+  notes: >
+    与 aishperf_openness 官方 rules/remote/ascend-910b 推理套件实体口径一致；
+    如官方 schema 字段有更新，以官方仓库为准并重新 validate。

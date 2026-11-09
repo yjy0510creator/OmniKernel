@@ -1,0 +1,67 @@
+"""[OmniKernel] $OP_NAME — Triton 后端（模板自动生成）
+策略: $STRATEGY；标准 FlashAttention-2 前向，fp32 在线累加。
+"""
+import math
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _fa_fwd(Q, K, V, O, sm_scale,
+            stride_qh, stride_qm,
+            seq_len, HEAD_DIM: tl.constexpr,
+            BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
+            CAUSAL: tl.constexpr):
+    pid_m = tl.program_id(0)
+    pid_bh = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, HEAD_DIM)
+    q_ptr = Q + pid_bh * stride_qh + offs_m[:, None] * stride_qm + offs_d[None, :]
+    mask_m = offs_m < seq_len
+    q = tl.load(q_ptr, mask=mask_m[:, None], other=0.0)
+
+    m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
+    l_i = tl.zeros([BLOCK_M], tl.float32)
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], tl.float32)
+
+    hi = (pid_m + 1) * BLOCK_M if CAUSAL else seq_len
+    for start_n in range(0, hi, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        k_ptr = K + pid_bh * stride_qh + offs_n[:, None] * stride_qm + offs_d[None, :]
+        v_ptr = V + pid_bh * stride_qh + offs_n[:, None] * stride_qm + offs_d[None, :]
+        mask_n = offs_n < seq_len
+        k = tl.load(k_ptr, mask=mask_n[:, None], other=0.0)
+        v = tl.load(v_ptr, mask=mask_n[:, None], other=0.0)
+        qk = tl.dot(q, tl.trans(k)) * sm_scale
+        if CAUSAL:
+            qk = tl.where(offs_m[:, None] >= offs_n[None, :], qk, float("-inf"))
+        qk = tl.where(mask_n[None, :], qk, float("-inf"))
+        m_new = tl.maximum(m_i, tl.max(qk, axis=1))
+        p = tl.exp(qk - m_new[:, None])
+        alpha = tl.exp(m_i - m_new)
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+        m_i = m_new
+
+    acc = acc / l_i[:, None]
+    o_ptr = O + pid_bh * stride_qh + offs_m[:, None] * stride_qm + offs_d[None, :]
+    tl.store(o_ptr, acc.to(O.dtype.element_ty), mask=mask_m[:, None])
+
+
+def run(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+        causal: bool = True) -> torch.Tensor:
+    """q/k/v: [b, h, s, d]（同 dtype，同 shape）；返回 o 同形状。"""
+    b, hh, s, d = q.shape
+    assert k.shape == v.shape == q.shape and d in (16, 32, 64, 128, 256)
+    q, k, v = (t.contiguous() for t in (q, k, v))
+    o = torch.empty_like(q)
+    BLOCK_M, BLOCK_N = $BLOCK_M, $BLOCK_N
+    grid = (triton.cdiv(s, BLOCK_M), b * hh)
+    _fa_fwd[grid](
+        q, k, v, o, 1.0 / math.sqrt(d),
+        q.stride(1), q.stride(2), s,
+        HEAD_DIM=d, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+        CAUSAL=causal, num_warps=$NUM_WARPS, num_stages=$NUM_STAGES,
+    )
+    return o

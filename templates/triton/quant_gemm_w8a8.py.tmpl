@@ -1,0 +1,51 @@
+"""[OmniKernel] $OP_NAME — Triton 后端（模板自动生成）
+策略: $STRATEGY；int8 tl.dot → int32 累加 → per-token/per-channel scale 反量化。
+"""
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _w8a8_gemm(A, B, SA, SB, C,
+               M, N, K,
+               stride_am, stride_ak, stride_bk, stride_bn,
+               BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+    a_ptrs = A + offs_m[:, None] * stride_am + offs_k[None, :]
+    b_ptrs = B + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
+    for _ in range(0, tl.cdiv(K, BLOCK_K)):
+        a = tl.load(a_ptrs, mask=mask_m[:, None], other=0)
+        b = tl.load(b_ptrs, mask=mask_n[None, :], other=0)
+        acc += tl.dot(a, b, out_dtype=tl.int32)
+        a_ptrs += BLOCK_K
+        b_ptrs += BLOCK_K * stride_bk
+    sa = tl.load(SA + offs_m, mask=mask_m, other=0.0)
+    sb = tl.load(SB + offs_n, mask=mask_n, other=0.0)
+    c = acc.to(tl.float32) * sa[:, None] * sb[None, :]
+    c_ptrs = C + offs_m[:, None] * N + offs_n[None, :]
+    tl.store(c_ptrs, c.to(C.dtype.element_ty), mask=mask_m[:, None] & mask_n[None, :])
+
+
+def run(a: torch.Tensor, b: torch.Tensor, sa: torch.Tensor, sb: torch.Tensor) -> torch.Tensor:
+    """a:[M,K] int8, b:[K,N] int8, sa:[M] fp32, sb:[N] fp32 -> y:[M,N] fp16"""
+    M, K = a.shape
+    _, N = b.shape
+    a, b = a.contiguous(), b.contiguous()
+    y = torch.empty((M, N), dtype=torch.float16, device=a.device)
+    BM, BN, BK = $BLOCK_M, $BLOCK_N, $BLOCK_K
+    grid = (triton.cdiv(M, BM), triton.cdiv(N, BN))
+    _w8a8_gemm[grid](
+        a, b, sa, sb, y, M, N, K,
+        a.stride(0), a.stride(1), b.stride(0), b.stride(1),
+        BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK,
+        num_warps=$NUM_WARPS, num_stages=3,
+    )
+    return y

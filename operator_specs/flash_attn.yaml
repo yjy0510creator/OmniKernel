@@ -1,0 +1,52 @@
+id: flash_attn
+name: FlashAttention-2 Forward
+category: attention-fused
+task_type: inference-forward
+description: >
+  融合 QK^T softmax PV 的精确注意力前向（FlashAttention-2 风格，分块在线 softmax），
+  避免物化 seq×seq 注意力矩阵，是大模型推理延迟/显存的核心优化算子。
+math: |
+  S = softmax(Q K^T / sqrt(d) [+ causal mask], axis=-1)
+  O = S V                       # kernel 内在线分块实现，数值上与上式等价
+io:
+  inputs:
+    - {name: q, shape: "[batch, heads, seq, dim]", dtypes: [fp16, bf16]}
+    - {name: k, shape: "[batch, heads, seq, dim]", dtypes: same-as-q}
+    - {name: v, shape: "[batch, heads, seq, dim]", dtypes: same-as-q}
+  outputs:
+    - {name: o, shape: "[batch, heads, seq, dim]", dtypes: same-as-q}
+  scalars:
+    - {name: sm_scale, type: float, default: 1/sqrt(dim)}
+    - {name: causal,   type: bool,  default: true}
+dtype_support: [fp16, bf16]
+tolerance:
+  fp16: {atol: 1.0e-2, rtol: 1.0e-2}
+  bf16: {atol: 2.0e-2, rtol: 2.0e-2}
+workloads:
+  - {batch: 1, heads: 32, seq: 4096,  dim: 128, causal: true}
+  - {batch: 4, heads: 32, seq: 2048,  dim: 128, causal: true}
+  - {batch: 2, heads: 40, seq: 4096,  dim: 128, causal: false}
+  - {batch: 8, heads: 16, seq: 1024,  dim: 128, causal: true}
+codegen:
+  triton:
+    template: templates/triton/flash_attn.py.tmpl
+    params:
+      BLOCK_M: 128
+      BLOCK_N: 64
+      NUM_WARPS: 4
+      NUM_STAGES: 3
+      FP32_ACCUM: true
+    strategy: Q 行块 × KV 列块循环；在线 softmax running max/sum 重标定；fp32 累加器
+  ascendc:
+    template: templates/ascendc/flash_attn.cpp.tmpl
+    params:
+      BLOCK_M: 128
+      BLOCK_N: 128
+      CUBE_TILE: 16x16
+    strategy: QK^T/PV 走 Cube(Matmul)，softmax 走 Vector，Cube-Vector 并行流水双缓冲
+fusion_opportunities:
+  - causal 分支下三角块跳过，理论 FLOPs 减半
+  - KV-Quant 读取与反量化在加载阶段完成
+notes: >
+  参考实现用逐段 fp32 分块 eager 计算（与 PyTorch F.sdpa 数学一致）控制参考自身显存；
+  数值判据 max|Δ|、max rel 同时受控，见 harness 报告。

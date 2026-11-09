@@ -1,0 +1,53 @@
+id: quant_gemm_w8a8
+name: Quant GEMM (W8A8)
+category: quantized-matmul
+task_type: inference-forward
+description: >
+  8bit 对称量化矩阵乘：int8 权重 × int8 激活 → int32 累加 → per-channel/per-token
+  scale 反量化 → fp16 输出。量化推理部署中替代 fp16 GEMM 的核心算子，直接对应
+  AISHPerf 基准"能否在真实量化推理部署中替代现有算子"的评测重心。
+math: |
+  y[m,n] = ( sum_k xa[m,k](int8) * wb[k,n](int8) ) * sx[m] * sw[n]
+  其中 xa = round(x / sx) 由宿主侧量化（本 spec 评测采用预量化输入）
+io:
+  inputs:
+    - {name: a,     shape: "[M, K]", dtypes: [int8]}
+    - {name: b,     shape: "[K, N]", dtypes: [int8], layout: row-major(模板含 col-major 变体)}
+    - {name: sa,    shape: "[M]",    dtypes: [fp32]}   # per-token scale
+    - {name: sb,    shape: "[N]",    dtypes: [fp32]}   # per-channel scale
+  outputs:
+    - {name: y, shape: "[M, N]", dtypes: [fp16, bf16]}
+  scalars:
+    - {name: bias, type: optional, shape: "[N]", dtypes: [fp16]}
+dtype_support: [fp16, bf16]
+tolerance:
+  fp16: {atol: 5.0e-2, rtol: 5.0e-2}    # 参考=同一量化输入下 fp32 dequant matmul
+  bf16: {atol: 1.0e-1, rtol: 5.0e-2}
+workloads:
+  - {M: 1,    K: 4096, N: 4096}         # 解码 GEMV 形状
+  - {M: 64,   K: 4096, N: 11008}
+  - {M: 512,  K: 4096, N: 4096}
+  - {M: 2048, K: 11008, N: 4096}
+codegen:
+  triton:
+    template: templates/triton/quant_gemm_w8a8.py.tmpl
+    params:
+      BLOCK_M: 64
+      BLOCK_N: 128
+      BLOCK_K: 64
+      NUM_WARPS: 4
+      GROUP_K: -1                       # -1 表示全通道单一 scale
+    strategy: int8 tl.dot 走 TensorCore int32 累加；出口一次 fp32 反量化+fp16 写回
+  ascendc:
+    template: templates/ascendc/quant_gemm_w8a8.cpp.tmpl
+    params:
+      CUBE_M: 128
+      CUBE_N: 256
+      CUBE_K: 128
+    strategy: int8 Matmul(int32 accum) 走 Cube；Vector 级联 scale 反量化，Cube-Vector 流水
+fusion_opportunities:
+  - scale 反量化与 bias-add / 下游激活融合
+  - 权重 layout（KN vs NK）在加载阶段完成，避免额外转置 kernel
+notes: >
+  精度评测口径：以"同量化输入 + fp32 反量化 matmul"为参考（隔离 kernel 误差与
+  量化算法误差），这是量化算子工业界通行做法，文档中已说明。

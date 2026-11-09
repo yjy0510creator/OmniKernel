@@ -1,0 +1,12 @@
+# OmniKernel 运行依赖
+# GPU 侧（NVIDIA）
+torch>=2.1
+triton>=2.2 ; platform_system!="Windows"
+numpy>=1.24
+pyyaml>=6.0
+
+# NPU 侧（昇腾）在对应机器上额外安装（版本需与 CANN 配套，见 README §3）：
+#   torch_npu、升腾 CANN Toolkit(>=8.0) + Ascend Toolchain(atvc)
+
+# LLM Agent 可选增强（不配置则自动退化为纯模板模式，全部结果仍可复现）：
+#   环境变量 OMNIKERNEL_LLM_BASE_URL / OMNIKERNEL_LLM_API_KEY / OMNIKERNEL_LLM_MODEL

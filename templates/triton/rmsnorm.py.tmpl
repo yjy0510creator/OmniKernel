@@ -1,0 +1,37 @@
+"""[OmniKernel] $OP_NAME — Triton 后端（模板自动生成）
+策略: $STRATEGY
+数值要点: 归约累加用 $ACCUM_DTYPE，避免 fp16 溢出。
+"""
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _rmsnorm_fwd(X, W, Y, stride_x, hidden, eps,
+                 BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK)
+    mask = cols < hidden
+    x = tl.load(X + row * stride_x + cols, mask=mask, other=0.0,
+                eviction_policy="evict_first").to(tl.float32)
+    w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
+    ms = tl.sum(x * x, axis=0) / hidden
+    rstd = 1.0 / tl.sqrt(ms + eps)
+    tl.store(Y + row * stride_x + cols, (x * rstd * w).to(Y.dtype.element_ty),
+             mask=mask)
+
+
+def run(x: torch.Tensor, w: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    """y = x / sqrt(mean(x^2)+eps) * w  （行方向 RMSNorm）"""
+    h = x.shape[-1]
+    assert w.numel() == h
+    y = torch.empty_like(x)
+    xr = x.contiguous().view(-1, h)
+    yr = y.view(-1, h)
+    BLOCK = max($BLOCK_SIZE, triton.next_power_of_2(h))
+    _rmsnorm_fwd[(xr.shape[0],)](
+        xr, w, yr, xr.stride(0), h, eps,
+        BLOCK=BLOCK, num_warps=$NUM_WARPS,
+    )
+    return y

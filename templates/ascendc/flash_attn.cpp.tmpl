@@ -1,0 +1,225 @@
+// [OmniKernel] $OP_NAME — AscendC 后端（模板自动生成）
+// 策略: $STRATEGY
+// 结构: Q 行块(BLOCK_M) × KV 列块(BLOCK_N)；S=QK^T 走 Cube，
+//       在线 softmax(running max/sum 重标定) 走 Vector，O+=P·V 再走 Cube。
+// 说明: 完整可编译骨架。Matmul 的 baseM/baseN/baseK 与 L1 复用参数由真机
+//       tiling 搜索回填（README §7 表位）；causal 掩码以行界填充实现，
+//       与 Triton 路径逐块 tl.where 数值等价（差异在 fp32 中间态、阈值内）。
+// 编译: atvc -O2 kernel.cpp -o flash_attn.auto -mcpu=ascend910b（CANN>=8.0）
+#include "kernel_operator.h"
+
+using namespace AscendC;
+
+template <typename T>
+class FlashAttnKernel {
+public:
+    __aicore__ inline FlashAttnKernel(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR o,
+                                      int64_t bh, int64_t seq, int64_t dim,
+                                      float smScale, bool causal)
+        : bh(bh), seq(seq), dim(dim), smScale(smScale), causal(causal) {
+        this->qGm.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(q));
+        this->kGm.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(k));
+        this->vGm.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(v));
+        this->oGm.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(o));
+        this->qIn.InitBuffer(2, BM * this->dim * sizeof(T));
+        this->kIn.InitBuffer(2, BN * this->dim * sizeof(T));
+        this->vIn.InitBuffer(2, BN * this->dim * sizeof(T));
+        this->sQue.InitBuffer(2, BM * BN * sizeof(T));
+        this->pQue.InitBuffer(2, BM * BN * sizeof(T));
+        this->accQue.InitBuffer(2, BM * this->dim * sizeof(float));
+        this->sBuf.InitBuffer(BM * BN * sizeof(float));
+        this->mBuf.InitBuffer(BM * sizeof(float));
+        this->lBuf.InitBuffer(BM * sizeof(float));
+        this->tmpBuf.InitBuffer(BM * sizeof(float));
+    }
+
+    __aicore__ inline void Process() {
+        for (int64_t b = this->coreIdx; b < this->bh; b += this->coreNum) {
+            for (int64_t m0 = 0; m0 < this->seq; m0 += BM) {
+                int64_t mLen = (m0 + BM < this->seq) ? BM : (this->seq - m0);
+                InitStats(mLen);
+                int64_t nEnd = this->causal ? (m0 + mLen) : this->seq;
+                for (int64_t n0 = 0; n0 < nEnd; n0 += BN) {
+                    int64_t nLen = (n0 + BN < this->seq) ? BN : (this->seq - n0);
+                    LoadQ(b, m0, mLen);
+                    LoadKV(b, n0, nLen);
+                    ComputeScores(mLen, nLen);
+                    OnlineSoftmax(mLen, nLen, n0, m0);
+                    AccumulateOutput(mLen, nLen);
+                }
+                NormalizeAndStore(b, m0, mLen);
+            }
+        }
+    }
+
+private:
+    static constexpr int64_t BM = $BLOCK_M;
+    static constexpr int64_t BN = $BLOCK_N;
+
+    __aicore__ inline void InitStats(int64_t mLen) {
+        LocalTensor<float> m = this->mBuf.Get<float>();
+        LocalTensor<float> l = this->lBuf.Get<float>();
+        LocalTensor<float> acc = this->accQue.AllocTensor<float>();
+        Dup(m, static_cast<float>(-INFINITY), mLen);
+        Dup(l, 0.0f, mLen);
+        Dup(acc, 0.0f, mLen * this->dim);
+        this->accQue.EnQue(acc);
+    }
+
+    __aicore__ inline void LoadQ(int64_t b, int64_t m0, int64_t mLen) {
+        if (this->qLoadedRow == m0 && this->qLoadedBh == b) return;
+        LocalTensor<T> q = this->qIn.DeQue<T>();
+        if (q.GetLen() == 0) q = this->qIn.AllocTensor<T>();
+        DataCopyExtParams qp = {1u, static_cast<uint32_t>(mLen * this->dim * sizeof(T)),
+                                0u, 0u, 0u};
+        DataCopyPad(q, this->qGm[b * this->seq * this->dim + m0 * this->dim], qp);
+        this->qIn.EnQue(q);
+        this->qLoadedRow = m0; this->qLoadedBh = b;
+    }
+
+    __aicore__ inline void LoadKV(int64_t b, int64_t n0, int64_t nLen) {
+        int64_t base = b * this->seq * this->dim;
+        LocalTensor<T> k = this->kIn.AllocTensor<T>();
+        LocalTensor<T> v = this->vIn.AllocTensor<T>();
+        DataCopyExtParams kp = {1u, static_cast<uint32_t>(nLen * this->dim * sizeof(T)),
+                                0u, 0u, 0u};
+        DataCopyPad(k, this->kGm[base + n0 * this->dim], kp);
+        this->kIn.EnQue(k);
+        DataCopyPad(v, this->vGm[base + n0 * this->dim], kp);
+        this->vIn.EnQue(v);
+    }
+
+    __aicore__ inline void ComputeScores(int64_t mLen, int64_t nLen) {
+        // S = Q @ K^T（int8/fp16 -> fp32 累加经 Matmul 输出 T 后升精度），走 Cube
+        LocalTensor<T> q = this->qIn.DeQue<T>();
+        LocalTensor<T> k = this->kIn.DeQue<T>();
+        LocalTensor<float> s = this->sBuf.Get<float>();
+        this->matmulQK.SetTensorA(q);
+        this->matmulQK.SetTensorB(k);
+        this->matmulQK.SetLocalTensor(s);
+        this->matmulQK.SetIterParams(mLen, nLen, this->dim);
+        this->matmulQK.IterateAll(s);
+        Muls(s, s, this->smScale, mLen * nLen);
+        this->qIn.EnQue(q);
+        this->kIn.Recycle(k);
+    }
+
+    __aicore__ inline void OnlineSoftmax(int64_t mLen, int64_t nLen,
+                                         int64_t n0, int64_t m0) {
+        LocalTensor<float> s = this->sBuf.Get<float>();
+        LocalTensor<float> m = this->mBuf.Get<float>();
+        LocalTensor<float> l = this->lBuf.Get<float>();
+        // causal：行 i 有效列 = min(nLen, m0+i+1-n0)，越界列以 -inf 填充
+        if (this->causal) {
+            for (int64_t i = 0; i < mLen; i++) {
+                int64_t valid = m0 + i + 1 - n0;
+                if (valid < 0) valid = 0;
+                if (valid < nLen) {
+                    Duplic(s[i * nLen + valid], static_cast<float>(-INFINITY),
+                           nLen - valid);
+                }
+            }
+        }
+        // 每行块最大
+        LocalTensor<float> blkMax = this->tmpBuf.GetAdditional<float>();
+        ReduceMaxParams rm{ReduceType::REDUCE_MAX, 1, static_cast<int8_t>(nLen),
+                           static_cast<uint64_t>(mLen), static_cast<uint64_t>(nLen),
+                           static_cast<uint64_t>(nLen)};
+        ReduceMax(blkMax, s, rm);
+        LocalTensor<float> newMax = this->tmpBuf.Get<float>();
+        Maximum(newMax, m, blkMax, mLen);
+        // 广播新行 max 后 exp(S - newMax)
+        LocalTensor<float> mCast = this->sBuf.GetAdditional<float>();
+        LocalTensor<float> expS = this->sBuf.Get<float>();      // 就地：s 后续不再需要原值
+        Repeat(newMax, mCast, mLen, nLen);
+        Sub(expS, s, mCast, mLen * nLen);
+        Exp(expS, expS, mLen * nLen);
+        // alpha = exp(m - newMax)；l = l*alpha + rowSum(P)
+        LocalTensor<float> alpha = this->mBuf.GetAdditional<float>();
+        Subs(alpha, m, newMax, mLen);
+        Exp(alpha, alpha, mLen);
+        LocalTensor<float> rowSum = this->lBuf.GetAdditional<float>();
+        ReduceSumParams rs{ReduceType::REDUCE_SUM, 1, static_cast<int8_t>(nLen),
+                           static_cast<uint64_t>(mLen), static_cast<uint64_t>(nLen),
+                           static_cast<uint64_t>(nLen)};
+        ReduceSum(rowSum, expS, rs);
+        Mul(l, l, alpha, mLen);
+        Adds(l, l, rowSum, mLen);
+        // 将 P 降回 T 供 PV matmul 使用
+        LocalTensor<T> p = this->pQue.AllocTensor<T>();
+        Cast(p, expS, CastCalRound::ROUND, mLen * nLen);
+        this->pQue.EnQue(p);
+        // 更新行 max
+        LocalTensor<float> mOut = this->mBuf.Get<float>();
+        DataCopy(mOut, newMax, (mLen + 3) / 4);
+    }
+
+    __aicore__ inline void AccumulateOutput(int64_t mLen, int64_t nLen) {
+        // acc = acc*alpha_broadcast + P @ V
+        LocalTensor<T> p = this->pQue.DeQue<T>();
+        LocalTensor<T> v = this->vIn.DeQue<T>();
+        LocalTensor<float> acc = this->accQue.DeQue<float>();
+        LocalTensor<float> alpha = this->mBuf.GetAdditional<float>();
+        LocalTensor<float> accb = this->tmpBuf.GetAdditional<float>();
+        // alpha 按行广播到 [mLen, dim] 后做旧累加值重标定
+        Repeat(alpha, accb, mLen, this->dim);
+        Mul(acc, acc, accb, mLen * this->dim);
+        LocalTensor<float> pv = this->sBuf.GetAdditional<float>();
+        this->matmulPV.SetTensorA(p);
+        this->matmulPV.SetTensorB(v);
+        this->matmulPV.SetLocalTensor(pv);
+        this->matmulPV.SetIterParams(mLen, this->dim, nLen);
+        this->matmulPV.IterateAll(pv);
+        Add(acc, acc, pv, mLen * this->dim);
+        this->pQue.Recycle(p);
+        this->vIn.Recycle(v);
+        this->accQue.EnQue(acc);
+    }
+
+    __aicore__ inline void NormalizeAndStore(int64_t b, int64_t m0, int64_t mLen) {
+        LocalTensor<float> acc = this->accQue.DeQue<float>();
+        LocalTensor<float> l = this->lBuf.Get<float>();
+        LocalTensor<float> lb = this->sBuf.GetAdditional<float>();
+        Repeat(l, lb, mLen, this->dim);
+        Div(acc, acc, lb, mLen * this->dim);
+        LocalTensor<T> y = this->sQue.AllocTensor<T>();
+        Cast(y, acc, CastCalRound::ROUND, mLen * this->dim);
+        DataCopyExtParams yp = {1u, static_cast<uint32_t>(mLen * this->dim * sizeof(T)),
+                                0u, 0u, 0u};
+        DataCopyPad(this->oGm[b * this->seq * this->dim + m0 * this->dim], y, yp);
+        this->accQue.Recycle(acc);
+        this->sQue.EnQue(y);
+        this->sQue.Recycle(y);
+    }
+
+    GlobalTensor<T> qGm, kGm, vGm, oGm;
+    TQue<TPosition::GM, CubePosition, 2> qIn, kIn, vIn;
+    TQue<QuePosition::VECIN, 2> pQue;
+    TQue<QuePosition::VECOUT, 2> accQue, sQue;
+    TBuf<QuePosition::VECCALC> sBuf, mBuf, lBuf, tmpBuf;
+    Matmul<T, T, float> matmulQK, matmulPV;
+    int64_t bh, seq, dim;
+    float smScale;
+    bool causal;
+    int64_t qLoadedRow = -1, qLoadedBh = -1;
+    uint32_t coreIdx = GetBlockIdx();
+    uint32_t coreNum = GetBlockNum();
+};
+
+extern "C" __global__ __aicore__ void flash_attn_gen(GM_ADDR q, GM_ADDR k, GM_ADDR v,
+                                                     GM_ADDR o, GM_ADDR workspace,
+                                                     GM_ADDR tiling) {
+    GET_TILING_DATA(tilingData, tiling);
+    REGISTER_KERNEL(T_TYPE);
+    if (T_TYPE == DESC_DT_FLOAT16) {
+        FlashAttnKernel<half> op(q, k, v, o, tilingData.bh, tilingData.seq,
+                                 tilingData.dim, tilingData.smScale,
+                                 tilingData.causal == 1);
+        op.Process();
+    } else if (T_TYPE == DESC_DT_BFLOAT16) {
+        FlashAttnKernel<bfloat16_t> op(q, k, v, o, tilingData.bh, tilingData.seq,
+                                       tilingData.dim, tilingData.smScale,
+                                       tilingData.causal == 1);
+        op.Process();
+    }
+}

@@ -1,0 +1,46 @@
+id: softmax
+name: Softmax
+category: activation-normalization
+task_type: inference-forward
+description: >
+  行方向数值稳定 Softmax，注意力分布与采样层的基础算子。
+  使用 max-subtraction 防溢出；行内两遍/在线归约。
+math: |
+  m = max_i(x_i)
+  e_i = exp(x_i - m)
+  out_i = e_i / sum_j(e_j)
+io:
+  inputs:
+    - {name: x, shape: "[rows, cols]", dtypes: [fp16, bf16, fp32]}
+  outputs:
+    - {name: y, shape: "[rows, cols]", dtypes: same-as-x}
+  scalars:
+    - {name: scale, type: float, default: 1.0}
+dtype_support: [fp16, bf16, fp32]
+tolerance:
+  fp16: {atol: 1.0e-3, rtol: 1.0e-3}
+  bf16: {atol: 5.0e-3, rtol: 5.0e-3}
+  fp32: {atol: 1.0e-6, rtol: 1.0e-6}
+workloads:
+  - {rows: 512,   cols: 512}
+  - {rows: 4096,  cols: 4096}
+  - {rows: 1024,  cols: 32000}     # 词表级 softmax（LM head）
+  - {rows: 16384, cols: 1024}
+codegen:
+  triton:
+    template: templates/triton/softmax.py.tmpl
+    params:
+      BLOCK_SIZE: auto_pow2(cols)
+      NUM_WARPS: auto
+      ONLINE_TWO_PASS: true
+    strategy: cols<=BLOCK 时单遍寄存器完成；超大 cols 走分块两遍（max/sum 扫描）
+  ascendc:
+    template: templates/ascendc/softmax.cpp.tmpl
+    params:
+      TILE_ELEMS: 4096
+      EXP_APPROX: lut               # 昇腾 Expi/AIV 指数近似单元
+    strategy: ReduceMax->Sub->Exp->ReduceSum->Div；超大行分块+第二遍归一
+fusion_opportunities:
+  - 已内嵌于 flash attention 的在线 softmax（独立算子用于采样路径）
+notes: >
+  exp 用 tl.exp（内部 libdevice）/ Ascend 用 Expi，均与 fp32 参考保持阈值内一致。

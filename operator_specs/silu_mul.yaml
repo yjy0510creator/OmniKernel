@@ -1,0 +1,43 @@
+id: silu_mul
+name: SiLU-Mul (SwiGLU)
+category: activation-fused
+task_type: inference-forward
+description: >
+  SwiGLU 门控激活融合算子：out = silu(a) * b。LLaMA/Mixtral FFN 中间层，
+  融合后单次读写，替代 elementwise-silu + mul 两个 kernel 的显存往返。
+math: |
+  silu(z) = z * sigmoid(z)
+  out = silu(a) * b
+io:
+  inputs:
+    - {name: a, shape: "[rows, inter]", dtypes: [fp16, bf16]}
+    - {name: b, shape: "[rows, inter]", dtypes: same-as-a}
+  outputs:
+    - {name: y, shape: "[rows, inter]", dtypes: same-as-a}
+  scalars: []
+dtype_support: [fp16, bf16]
+tolerance:
+  fp16: {atol: 1.0e-2, rtol: 1.0e-2}
+  bf16: {atol: 2.0e-2, rtol: 2.0e-2}
+workloads:
+  - {rows: 1,   inter: 11008}
+  - {rows: 512, inter: 11008}
+  - {rows: 4096, inter: 14336}
+  - {rows: 8192, inter: 8192}
+codegen:
+  triton:
+    template: templates/triton/silu_mul.py.tmpl
+    params:
+      BLOCK_SIZE: 1024
+      NUM_WARPS: 8
+      EVEN_FASTPATH: true
+    strategy: 纯逐元素，大网格一维铺满；sigmoid 用 tl.sigmoid；无归约零同步
+  ascendc:
+    template: templates/ascendc/silu_mul.cpp.tmpl
+    params:
+      TILE_ELEMS: 8192
+    strategy: Sigmoid->Mul->Mul 三级 Vector 流水；双缓冲打满 AIV 带宽
+fusion_opportunities:
+  - 上游 gate/up 双 GEMM 输出直接衔接，省中间 fp16 拷贝
+notes: >
+  逐元素算子的优化重点是访存：向量化 128bit 加载、避免多余类型转换。

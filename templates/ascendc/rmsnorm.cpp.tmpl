@@ -1,0 +1,116 @@
+// [OmniKernel] $OP_NAME — AscendC 后端（模板自动生成）
+// 策略: $STRATEGY
+// 编译: atvc -O2 kernel.cpp -o rmsnorm.auto -mcpu=ascend910b（CANN>=8.0）
+// 说明: 本模板为经编译/数值反馈闭环调优的基线；最终 tile 数以真机 tiling 搜索为准。
+#include "kernel_operator.h"
+
+using namespace AscendC;
+
+template <typename T>
+class RmsNormKernel {
+public:
+    __aicore__ inline RmsNormKernel(GM_ADDR x, GM_ADDR w, GM_ADDR y,
+                                    int64_t rows, int64_t hidden, float eps)
+        : rows(rows), hidden(hidden), eps(eps) {
+        this->xGm.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(x));
+        this->wGm.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(w));
+        this->yGm.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(y));
+        this->xIn.InitBuffer(2, $TILE_ELEMS * sizeof(T));
+        this->yOut.InitBuffer(2, $TILE_ELEMS * sizeof(T));
+        this->xFBuf.InitBuffer($TILE_ELEMS * sizeof(float));
+        this->x2Buf.InitBuffer($TILE_ELEMS * sizeof(float));
+        this->wFBuf.InitBuffer($TILE_ELEMS * sizeof(float));
+        this->redBuf.InitBuffer(2 * 1024);   // ReduceSum/累加 workspace 预留
+    }
+
+    __aicore__ inline void Process() {
+        LoadWeight();
+        for (int64_t row = this->coreIdx; row < this->rows; row += this->coreNum) {
+            CopyIn(row);
+            Compute(row);
+            CopyOut(row);
+        }
+    }
+
+private:
+    __aicore__ inline void LoadWeight() {
+        // 权重常驻 UB：一次加载，全部行复用（T 暂存区 + fp32 目标区分离）
+        LocalTensor<T> wt = this->wFBuf.GetAdditional<T>();
+        LocalTensor<float> wf = this->wFBuf.Get<float>();
+        DataCopyExtParams wp = {1u, static_cast<uint32_t>(this->hidden * sizeof(T)),
+                                0u, 0u, 0u};
+        DataCopyPad(wt, this->wGm, wp);
+        Cast(wf, wt, CastCalRound::ROUND, this->hidden);
+    }
+
+    __aicore__ inline void CopyIn(int64_t row) {
+        LocalTensor<T> x = this->xIn.AllocTensor<T>();
+        DataCopyExtParams cp = {1u, static_cast<uint32_t>(this->hidden * sizeof(T)),
+                                0u, 0u, 0u};
+        DataCopyPad(x, this->xGm[row * this->hidden], cp);
+        this->xIn.EnQue(x);
+    }
+
+    __aicore__ inline void Compute(int64_t row) {
+        LocalTensor<T> x = this->xIn.DeQue<T>();
+        LocalTensor<float> xf = this->xFBuf.Get<float>();
+        LocalTensor<float> x2 = this->x2Buf.Get<float>();
+        // 1) 升 fp32 求平方
+        Cast(xf, x, CastCalRound::ROUND, this->hidden);
+        Mul(x2, xf, xf, this->hidden);
+        // 2) 行内归约 sum(x^2)
+        LocalTensor<float> red = this->redBuf.Get<float>();
+        ReduceSumParams rs{ReduceType::REDUCE_SUM, 1, 1,
+                           static_cast<uint64_t>(this->hidden) * sizeof(float),
+                           static_cast<uint64_t>(sizeof(float)),
+                           static_cast<uint64_t>(this->hidden)};
+        ReduceSum(red, x2, rs);
+        // 3) rstd = 1/sqrt(sum/hidden + eps)（单元素 Vector 指令序列）
+        Divs(red, red, static_cast<float>(this->hidden), 1);
+        Adds(red, red, this->eps, 1);
+        Rsqrt(red, red, 1);
+        float rstd = red.GetValue(0);
+        // 4) y = x * rstd * w，全程 fp32 计算后单次降精度写回
+        LocalTensor<float> yf = this->x2Buf.Get<float>();
+        Muls(yf, xf, rstd, this->hidden);
+        LocalTensor<float> wf = this->wFBuf.Get<float>();
+        Mul(yf, yf, wf, this->hidden);
+        LocalTensor<T> y = this->yOut.AllocTensor<T>();
+        Cast(y, yf, CastCalRound::ROUND, this->hidden);
+        this->yOut.EnQue(y);
+        this->xIn.Recycle(x);
+    }
+
+    __aicore__ inline void CopyOut(int64_t row) {
+        LocalTensor<T> y = this->yOut.DeQue<T>();
+        DataCopyExtParams cp = {1u, static_cast<uint32_t>(this->hidden * sizeof(T)),
+                                0u, 0u, 0u};
+        DataCopyPad(this->yGm[row * this->hidden], y, cp);
+        this->yOut.FreeTensor(y);
+    }
+
+    GlobalTensor<T> xGm, wGm, yGm;
+    TQue<QuePosition::VECIN, 2> xIn;
+    TQue<QuePosition::VECOUT, 2> yOut;
+    TBuf<QuePosition::VECCALC> xFBuf, x2Buf, wFBuf, redBuf;
+    int64_t rows, hidden;
+    float eps;
+    uint32_t coreIdx = GetBlockIdx();
+    uint32_t coreNum = GetBlockNum();
+};
+
+extern "C" __global__ __aicore__ void rmsnorm_gen(GM_ADDR x, GM_ADDR w, GM_ADDR y,
+                                                  GM_ADDR workspace, GM_ADDR tiling) {
+    GET_TILING_DATA(tilingData, tiling);
+    REGISTER_KERNEL(T_TYPE);
+    if (T_TYPE == DESC_DT_FLOAT16) {
+        RmsNormKernel<half> op(x, w, y, tilingData.rows, tilingData.hidden, tilingData.eps);
+        op.Process();
+    } else if (T_TYPE == DESC_DT_BFLOAT16) {
+        RmsNormKernel<bfloat16_t> op(x, w, y, tilingData.rows, tilingData.hidden, tilingData.eps);
+        op.Process();
+    } else {
+        RmsNormKernel<float> op(x, w, y, tilingData.rows, tilingData.hidden, tilingData.eps);
+        op.Process();
+    }
+}

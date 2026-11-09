@@ -1,0 +1,34 @@
+# AISHPerf 评测规则（草案）：OmniKernel 算子生成套件判据
+# 阈值与 operator_specs/*.yaml 的 tolerance 字段保持一致，单一事实源。
+rule:
+  name: operator_gen_rule
+  suite: omnikernel_operator_gen
+  compile:
+    require_zero_error: true
+    timeout_s: 300
+  numerical:
+    reference: fp32-eager          # 金标准：PyTorch eager fp32
+    per_dtype_tolerance:
+      fp16: {atol: 1.0e-2, rtol: 1.0e-2}
+      bf16: {atol: 2.0e-2, rtol: 2.0e-2}
+    quantized_ops:
+      # 量化算子口径：同量化输入 + fp32 反量化 matmul 为参考（隔离 kernel 与算法误差）
+      quant_gemm_w8a8: {atol: 5.0e-2, rtol: 5.0e-2}
+    workload_matrix: from_spec     # 直接引用 operator_specs 的 workloads
+    pass_criterion: all_workloads  # 全 workload 通过才算 precision PASS
+  performance:
+    warmup: 10
+    iters: 50
+    metric: median_latency         # 抗长尾；同时记录 p90
+    baselines:
+      rmsnorm: torch-native
+      rope: torch-native
+      softmax: torch-native
+      silu_mul: torch-native-two-kernel      # 未融合的 silu+mul 两 kernel 基线
+      flash_attn: torch-sdpa                 # F.scaled_dot_product_attention
+      quant_gemm_w8a8: torch-dequant-fp16-gemm
+    target: "speedup_vs_baseline >= 1.0 且 peak_mem 不高于基线"
+  cross_backend:
+    # 同一 spec 在 ascendc / triton 两后端各自 PASS 后，比对后端间输出一致性
+    consistency_atol: 3.0e-2
+    consistency_rtol: 3.0e-2

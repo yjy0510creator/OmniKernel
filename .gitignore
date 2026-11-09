@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.o
+*.auto
+*.pt2
+generated/
+results/
+aishperf/run/results/
+aishperf/run/summary.json
+.venv/
